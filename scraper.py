@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Optional
 
 from playwright.sync_api import sync_playwright, Page, Browser
+from urllib.parse import urlparse, urljoin
+
+from listing_crawler import ListingCrawler
 
 
 @dataclass
@@ -58,13 +61,12 @@ class HemispheresScraper:
     def scrape(self, url: str) -> Article:
         """Scrape an article from the given URL."""
         with sync_playwright() as p:
-            browser = p.chromium.launch(
+            browser = p.firefox.launch(
                 headless=self.headless,
-                args=[
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-web-security',
-                    '--disable-features=IsolateOrigins,site-per-process',
-                ]
+                firefox_user_prefs={
+                    'network.http.http2.enabled': False,
+                    'network.http.http3.enabled': False,
+                }
             )
             try:
                 context = browser.new_context(
@@ -518,3 +520,309 @@ class HemispheresScraper:
                 "markdown": md_path
             }
         }
+
+    def scrape_batch(self, listing_url: str, max_articles: Optional[int] = None, progress_callback=None) -> list:
+        """
+        Main batch processing entry point.
+
+        Scrapes multiple articles from a listing page.
+
+        Args:
+            listing_url: URL of the listing page containing article links
+            max_articles: Maximum number of articles to scrape (None for all)
+            progress_callback: Optional callback function(current, total, url) for progress updates
+
+        Returns:
+            List of result dictionaries with keys: url, success, files, error, file_paths
+        """
+        # Create listing crawler to get all article URLs
+        crawler = ListingCrawler(headless=self.headless)
+        urls = crawler.get_article_urls(listing_url)
+
+        if max_articles:
+            urls = urls[:max_articles]
+
+        valid_urls = [url for url in urls if self._is_valid_article_url(url)]
+
+        print(f"\nFound {len(urls)} total URLs, {len(valid_urls)} valid article URLs")
+        print(f"Will scrape up to {len(valid_urls)} articles\n")
+
+        # Initialize results list - one entry per URL
+        results = []
+
+        # Reuse browser setup logic from scrape() but keep browser open
+        with sync_playwright() as p:
+            browser = p.firefox.launch(
+                headless=self.headless,
+                firefox_user_prefs={
+                    'network.http.http2.enabled': False,
+                    'network.http.http3.enabled': False,
+                }
+            )
+            try:
+                context = browser.new_context(
+                    viewport={"width": 1280, "height": 800},
+                    user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                    extra_http_headers={
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                        "Accept-Language": "en-US,en;q=0.5",
+                        "Accept-Encoding": "gzip, deflate, br",
+                        "DNT": "1",
+                        "Connection": "keep-alive",
+                        "Upgrade-Insecure-Requests": "1",
+                        "Sec-Fetch-Dest": "document",
+                        "Sec-Fetch-Mode": "navigate",
+                        "Sec-Fetch-Site": "none",
+                        "Sec-Fetch-User": "?1",
+                        "Cache-Control": "max-age=0",
+                    }
+                )
+
+                # Inject stealth script to avoid detection
+                context.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3, 4, 5]
+                    });
+                    window.chrome = { runtime: {} };
+                """)
+
+                page = context.new_page()
+
+                # Process each URL
+                for index, url in enumerate(valid_urls, 1):
+                    print(f"Scraping {index} of {len(valid_urls)}: {url}")
+
+                    if progress_callback:
+                        progress_callback(index, len(valid_urls), url)
+
+                    result = self._scrape_single_article_in_batch(page, url)
+                    results.append(result)
+                    print()
+
+                context.close()
+            finally:
+                browser.close()
+
+        return results
+
+    def _scrape_single_article_in_batch(self, page: Page, url: str) -> dict:
+        """
+        Scrapes a single article during batch processing.
+
+        Args:
+            page: Playwright page instance
+            url: Article URL to scrape
+
+        Returns:
+            Result dictionary with keys: url, success, files, error, file_paths
+        """
+        result = {
+            "url": url,
+            "success": False,
+            "files": [],
+            "error": None,
+            "file_paths": {}
+        }
+
+        try:
+            # Navigate to the URL
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+
+            # Call existing _scrape_page logic
+            article = self._scrape_page(page, url)
+
+            # Generate unique filename based on URL
+            base_name = self._generate_unique_filename(url)
+
+            # Save article with custom filename
+            saved_files = self._save_article_batch(article, base_name)
+
+            result["success"] = True
+            result["files"] = ["json", "html", "markdown"]
+            result["file_paths"] = saved_files
+            print(f"  ✓ Successfully scraped: {article.title}")
+
+        except Exception as e:
+            result["error"] = str(e)
+            print(f"  ✗ Failed to scrape: {e}")
+
+        return result
+
+    def _generate_unique_filename(self, url: str) -> str:
+        """
+        Extracts slug from URL path for use as filename.
+
+        Example: URL `/africa/morocco/marrakesh-solo-travel.html`
+        → `marrakesh-solo-travel`
+
+        Args:
+            url: Article URL
+
+        Returns:
+            Base filename without extension
+        """
+        parsed = urlparse(url)
+        path = parsed.path
+
+        # Get the last segment of the path
+        filename = path.split('/')[-1]
+
+        # Remove .html extension if present
+        if filename.endswith('.html'):
+            filename = filename[:-5]
+
+        # Fallback if empty
+        if not filename:
+            filename = "article"
+
+        return filename
+
+    def _save_article_batch(self, article: Article, base_name: str) -> dict:
+        """
+        Saves article with custom filename (not just "article.json").
+
+        Creates subdirectory based on region if needed.
+
+        Args:
+            article: Article to save
+            base_name: Base filename (without extension)
+
+        Returns:
+            Dictionary of saved file paths
+        """
+        # Extract region from URL path for subdirectory
+        parsed = urlparse(article.url)
+        path_parts = [p for p in parsed.path.split('/') if p]
+
+        # Determine region subdirectory (e.g., 'africa', 'asia', etc.)
+        region = None
+        if len(path_parts) >= 2:
+            # URL pattern: /places-to-go/{region}/{country}/{article}.html
+            if path_parts[0] == 'places-to-go' and len(path_parts) >= 2:
+                region = path_parts[1]
+
+        # Create subdirectory if region found
+        if region:
+            output_subdir = self.output_dir / region
+            output_subdir.mkdir(exist_ok=True)
+        else:
+            output_subdir = self.output_dir
+
+        # Save JSON
+        json_path = output_subdir / f"{base_name}.json"
+        data = {
+            "url": article.url,
+            "title": article.title,
+            "subtitle": article.subtitle,
+            "date": article.date,
+            "author": article.author,
+            "hero_image": {
+                "src": article.hero_image.src,
+                "alt": article.hero_image.alt,
+                "caption": article.hero_image.caption
+            } if article.hero_image else None,
+            "sections": [
+                {
+                    "heading": s.heading,
+                    "heading_level": s.heading_level,
+                    "content": s.content,
+                    "images": [
+                        {
+                            "src": img.src,
+                            "alt": img.alt,
+                            "caption": img.caption
+                        }
+                        for img in s.images
+                    ]
+                }
+                for s in article.sections
+            ],
+            "related_articles": article.related_articles,
+            "scraped_at": datetime.now().isoformat()
+        }
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        print(f"  Saved JSON: {json_path}")
+
+        # Save HTML
+        html_path = output_subdir / f"{base_name}.html"
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(article.raw_html)
+        print(f"  Saved HTML: {html_path}")
+
+        # Save Markdown
+        md_path = output_subdir / f"{base_name}.md"
+        md_content = self._generate_markdown(article)
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(md_content)
+        print(f"  Saved Markdown: {md_path}")
+
+        return {
+            "json": str(json_path),
+            "md": str(md_path),
+            "html": str(html_path)
+        }
+
+    def _get_output_files_for_url(self, url: str, base_name: str) -> dict:
+        """
+        Get the output file paths for a given URL.
+
+        Args:
+            url: Article URL
+            base_name: Base filename
+
+        Returns:
+            Dictionary of file paths
+        """
+        parsed = urlparse(url)
+        path_parts = [p for p in parsed.path.split('/') if p]
+
+        region = None
+        if len(path_parts) >= 2:
+            if path_parts[0] == 'places-to-go' and len(path_parts) >= 2:
+                region = path_parts[1]
+
+        if region:
+            output_subdir = self.output_dir / region
+        else:
+            output_subdir = self.output_dir
+
+        return {
+            "json": str(output_subdir / f"{base_name}.json"),
+            "md": str(output_subdir / f"{base_name}.md"),
+            "html": str(output_subdir / f"{base_name}.html")
+        }
+
+    def _is_valid_article_url(self, url: str) -> bool:
+        """
+        Check if a URL is a valid article URL (not index page).
+
+        Args:
+            url: URL to check
+
+        Returns:
+            True if valid article URL
+        """
+        parsed = urlparse(url)
+
+        # Must be HTTP or HTTPS
+        if parsed.scheme not in ('http', 'https'):
+            return False
+
+        # Must have a path that looks like an article
+        path = parsed.path.lower()
+        if not path or path == '/':
+            return False
+
+        # Must NOT be an index.html page (these are listing pages, not articles)
+        if path.endswith("/index.html") or path.endswith("/index"):
+            return False
+
+        # Must be an actual article page (ends with .html)
+        if not path.endswith(".html"):
+            return False
+
+        return True
