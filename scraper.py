@@ -521,7 +521,7 @@ class HemispheresScraper:
             }
         }
 
-    def scrape_batch(self, listing_url: str, max_articles: Optional[int] = None, progress_callback=None) -> list:
+    def scrape_batch(self, listing_url: str, max_articles: Optional[int] = None, progress_callback=None, place_slug: str | None = None) -> list:
         """
         Main batch processing entry point.
 
@@ -531,13 +531,14 @@ class HemispheresScraper:
             listing_url: URL of the listing page containing article links
             max_articles: Maximum number of articles to scrape (None for all)
             progress_callback: Optional callback function(current, total, url) for progress updates
+            place_slug: Optional place slug to filter articles (e.g., "africa", "asia")
 
         Returns:
             List of result dictionaries with keys: url, success, files, error, file_paths
         """
         # Create listing crawler to get all article URLs
         crawler = ListingCrawler(headless=self.headless)
-        urls = crawler.get_article_urls(listing_url)
+        urls = crawler.get_article_urls(listing_url, place_slug=place_slug)
 
         if max_articles:
             urls = urls[:max_articles]
@@ -607,6 +608,305 @@ class HemispheresScraper:
                 browser.close()
 
         return results
+
+    def scrape_all_places(self, index_url: str, max_articles_per_place: Optional[int] = None) -> dict:
+        """
+        Scrape articles from all places (regions) found on the index page.
+
+        Args:
+            index_url: URL of the main places-to-go index page
+            max_articles_per_place: Maximum number of articles to scrape per place (None for all)
+
+        Returns:
+            Dictionary with aggregated results:
+            {
+                "total_places": int,
+                "places": {
+                    "place_slug": {"total": int, "successful": int, "failed": int, "urls": [...]},
+                    ...
+                },
+                "total_articles": int,
+                "total_successful": int,
+                "total_failed": int
+            }
+        """
+        # Create listing crawler to get all place URLs
+        crawler = ListingCrawler(headless=self.headless)
+        place_urls = crawler.get_place_urls(index_url)
+
+        # Extract place slugs from URLs
+        places_data = {}
+        for place_url in place_urls:
+            parsed = urlparse(place_url)
+            path_parts = [p for p in parsed.path.split('/') if p]
+            if len(path_parts) >= 2 and path_parts[0] == 'places-to-go':
+                place_slug = path_parts[1]
+                places_data[place_slug] = place_url
+
+        print(f"\nFound {len(places_data)} places to scrape")
+        print("=" * 60)
+
+        # Initialize results structure
+        results = {
+            "total_places": len(places_data),
+            "places": {},
+            "total_articles": 0,
+            "total_successful": 0,
+            "total_failed": 0
+        }
+
+        # Process each place
+        for place_slug, place_url in sorted(places_data.items()):
+            print(f"\n\n{'='*60}")
+            print(f"Processing place: {place_slug.upper()}")
+            print(f"URL: {place_url}")
+            print(f"{'='*60}\n")
+
+            # Create place-specific output directory
+            place_output_dir = self.output_dir / place_slug
+            place_output_dir.mkdir(exist_ok=True)
+
+            # Get article URLs for this specific place
+            article_urls = crawler.get_article_urls(place_url, place_slug)
+
+            if max_articles_per_place:
+                article_urls = article_urls[:max_articles_per_place]
+
+            valid_urls = [url for url in article_urls if self._is_valid_article_url(url)]
+
+            print(f"\nFound {len(valid_urls)} valid articles for {place_slug}")
+
+            # Initialize place results
+            place_results = {
+                "total": len(valid_urls),
+                "successful": 0,
+                "failed": 0,
+                "urls": valid_urls
+            }
+
+            if not valid_urls:
+                results["places"][place_slug] = place_results
+                print(f"No articles to scrape for {place_slug}, skipping...")
+                continue
+
+            # Scrape articles for this place
+            place_successful = 0
+            place_failed = 0
+
+            # Reuse browser for all articles in this place
+            with sync_playwright() as p:
+                browser = p.firefox.launch(
+                    headless=self.headless,
+                    firefox_user_prefs={
+                        'network.http.http2.enabled': False,
+                        'network.http.http3.enabled': False,
+                    }
+                )
+                try:
+                    context = browser.new_context(
+                        viewport={"width": 1280, "height": 800},
+                        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                        extra_http_headers={
+                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                            "Accept-Language": "en-US,en;q=0.5",
+                            "Accept-Encoding": "gzip, deflate, br",
+                            "DNT": "1",
+                            "Connection": "keep-alive",
+                            "Upgrade-Insecure-Requests": "1",
+                            "Sec-Fetch-Dest": "document",
+                            "Sec-Fetch-Mode": "navigate",
+                            "Sec-Fetch-Site": "none",
+                            "Sec-Fetch-User": "?1",
+                            "Cache-Control": "max-age=0",
+                        }
+                    )
+
+                    # Inject stealth script to avoid detection
+                    context.add_init_script("""
+                        Object.defineProperty(navigator, 'webdriver', {
+                            get: () => undefined
+                        });
+                        Object.defineProperty(navigator, 'plugins', {
+                            get: () => [1, 2, 3, 4, 5]
+                        });
+                        window.chrome = { runtime: {} };
+                    """)
+
+                    page = context.new_page()
+
+                    # Process each URL for this place
+                    for index, url in enumerate(valid_urls, 1):
+                        print(f"\n[{place_slug}] Scraping {index} of {len(valid_urls)}: {url}")
+
+                        result = self._scrape_single_article_for_place(page, url, place_slug)
+
+                        if result["success"]:
+                            place_successful += 1
+                            print(f"  ✓ Successfully scraped: {result.get('title', 'Unknown')}")
+                        else:
+                            place_failed += 1
+                            print(f"  ✗ Failed to scrape: {result.get('error', 'Unknown error')}")
+
+                    context.close()
+                finally:
+                    browser.close()
+
+            # Update place results
+            place_results["successful"] = place_successful
+            place_results["failed"] = place_failed
+            results["places"][place_slug] = place_results
+
+            # Update totals
+            results["total_articles"] += len(valid_urls)
+            results["total_successful"] += place_successful
+            results["total_failed"] += place_failed
+
+            print(f"\n{'='*60}")
+            print(f"Place '{place_slug}' complete: {place_successful} successful, {place_failed} failed")
+            print(f"{'='*60}")
+
+        # Print final summary
+        print(f"\n\n{'='*60}")
+        print("ALL PLACES COMPLETE")
+        print(f"{'='*60}")
+        print(f"Total places: {results['total_places']}")
+        print(f"Total articles: {results['total_articles']}")
+        print(f"Total successful: {results['total_successful']}")
+        print(f"Total failed: {results['total_failed']}")
+        print(f"{'='*60}")
+
+        return results
+
+    def _scrape_single_article_for_place(self, page: Page, url: str, place_slug: str) -> dict:
+        """
+        Scrapes a single article and saves it to a place-specific directory.
+
+        Args:
+            page: Playwright page instance
+            url: Article URL to scrape
+            place_slug: Place slug for directory organization
+
+        Returns:
+            Result dictionary with keys: url, success, title, error, file_paths
+        """
+        result = {
+            "url": url,
+            "success": False,
+            "title": None,
+            "error": None,
+            "file_paths": {}
+        }
+
+        try:
+            # Navigate to the URL
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+
+            # Scrape the article
+            article = self._scrape_page(page, url)
+            result["title"] = article.title
+
+            # Generate unique filename based on URL
+            base_name = self._generate_unique_filename(url)
+
+            # Save article to place-specific directory
+            saved_files = self._save_article_to_place(article, base_name, place_slug)
+
+            result["success"] = True
+            result["file_paths"] = saved_files
+
+        except Exception as e:
+            result["error"] = str(e)
+
+        return result
+
+    # Mapping from URL slugs to display names for folders
+    PLACE_NAMES = {
+        "africa": "Africa",
+        "asia": "Asia",
+        "australia-and-the-pacific": "Australia and the Pacific",
+        "caribbean": "The Caribbean",
+        "central-america-and-mexico": "Central America and Mexico",
+        "europe": "Europe",
+        "middle-east": "The Middle East",
+        "south-america": "South America",
+        "us-and-canada": "U.S. and Canada",
+    }
+
+    def _get_place_display_name(self, place_slug: str) -> str:
+        """Get the display name for a place slug."""
+        return self.PLACE_NAMES.get(place_slug, place_slug.replace("-", " ").title())
+
+    def _save_article_to_place(self, article: Article, base_name: str, place_slug: str) -> dict:
+        """
+        Saves article to a place-specific subdirectory.
+
+        Args:
+            article: Article to save
+            base_name: Base filename (without extension)
+            place_slug: Place slug for subdirectory
+
+        Returns:
+            Dictionary of saved file paths
+        """
+        # Create place-specific output directory using display name
+        place_display_name = self._get_place_display_name(place_slug)
+        output_subdir = self.output_dir / place_display_name
+        output_subdir.mkdir(exist_ok=True)
+
+        # Save JSON
+        json_path = output_subdir / f"{base_name}.json"
+        data = {
+            "url": article.url,
+            "title": article.title,
+            "subtitle": article.subtitle,
+            "date": article.date,
+            "author": article.author,
+            "hero_image": {
+                "src": article.hero_image.src,
+                "alt": article.hero_image.alt,
+                "caption": article.hero_image.caption
+            } if article.hero_image else None,
+            "sections": [
+                {
+                    "heading": s.heading,
+                    "heading_level": s.heading_level,
+                    "content": s.content,
+                    "images": [
+                        {
+                            "src": img.src,
+                            "alt": img.alt,
+                            "caption": img.caption
+                        }
+                        for img in s.images
+                    ]
+                }
+                for s in article.sections
+            ],
+            "related_articles": article.related_articles,
+            "scraped_at": datetime.now().isoformat()
+        }
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        print(f"  Saved JSON: {json_path}")
+
+        # Save HTML
+        html_path = output_subdir / f"{base_name}.html"
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(article.raw_html)
+        print(f"  Saved HTML: {html_path}")
+
+        # Save Markdown
+        md_path = output_subdir / f"{base_name}.md"
+        md_content = self._generate_markdown(article)
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(md_content)
+        print(f"  Saved Markdown: {md_path}")
+
+        return {
+            "json": str(json_path),
+            "md": str(md_path),
+            "html": str(html_path)
+        }
 
     def _scrape_single_article_in_batch(self, page: Page, url: str) -> dict:
         """
@@ -698,15 +998,17 @@ class HemispheresScraper:
         path_parts = [p for p in parsed.path.split('/') if p]
 
         # Determine region subdirectory (e.g., 'africa', 'asia', etc.)
+        # URL pattern: /en/us/hemispheres/places-to-go/{region}/{country}/{article}.html
         region = None
-        if len(path_parts) >= 2:
-            # URL pattern: /places-to-go/{region}/{country}/{article}.html
-            if path_parts[0] == 'places-to-go' and len(path_parts) >= 2:
-                region = path_parts[1]
+        if 'places-to-go' in path_parts:
+            places_index = path_parts.index('places-to-go')
+            if len(path_parts) > places_index + 1:
+                region = path_parts[places_index + 1]
 
-        # Create subdirectory if region found
+        # Create subdirectory if region found, using display name
         if region:
-            output_subdir = self.output_dir / region
+            place_display_name = self._get_place_display_name(region)
+            output_subdir = self.output_dir / place_display_name
             output_subdir.mkdir(exist_ok=True)
         else:
             output_subdir = self.output_dir
@@ -780,13 +1082,16 @@ class HemispheresScraper:
         parsed = urlparse(url)
         path_parts = [p for p in parsed.path.split('/') if p]
 
+        # URL pattern: /en/us/hemispheres/places-to-go/{region}/{country}/{article}.html
         region = None
-        if len(path_parts) >= 2:
-            if path_parts[0] == 'places-to-go' and len(path_parts) >= 2:
-                region = path_parts[1]
+        if 'places-to-go' in path_parts:
+            places_index = path_parts.index('places-to-go')
+            if len(path_parts) > places_index + 1:
+                region = path_parts[places_index + 1]
 
         if region:
-            output_subdir = self.output_dir / region
+            place_display_name = self._get_place_display_name(region)
+            output_subdir = self.output_dir / place_display_name
         else:
             output_subdir = self.output_dir
 
